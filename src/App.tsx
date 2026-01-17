@@ -1,4 +1,4 @@
-import { FormEvent, useState } from "react";
+import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import "./App.css";
 
@@ -7,38 +7,106 @@ type Message = {
   text: string;
 };
 
+type Session = {
+  id: string;
+  name: string;
+  workspace_path: string;
+  created_at: number;
+  last_active: number;
+};
+
 function App() {
+  const [sessions, setSessions] = useState<Session[]>([]);
+  const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [draft, setDraft] = useState("");
   const [isSending, setIsSending] = useState(false);
   const [isCreatingSession, setIsCreatingSession] = useState(false);
-  const [sessionId, setSessionId] = useState<string | null>(null);
+  const [isSelectingWorkspace, setIsSelectingWorkspace] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [workspacePath, setWorkspacePath] = useState<string | null>(null);
 
-  const ensureSession = async () => {
-    if (sessionId) return sessionId;
-    const newId = await invoke<string>("create_agent_session");
-    setSessionId(newId);
-    return newId;
+  // Load sessions on mount
+  useEffect(() => {
+    loadSessions();
+  }, []);
+
+  const loadSessions = async () => {
+    try {
+      const loadedSessions = await invoke<Session[]>("list_sessions");
+      setSessions(loadedSessions);
+    } catch (err) {
+      console.error("Failed to load sessions:", err);
+    }
   };
 
-  const startNewSession = async () => {
+  const createNewSession = async () => {
+    setIsSelectingWorkspace(true);
     setIsCreatingSession(true);
     setError(null);
     try {
-      const newId = await invoke<string>("create_agent_session");
-      setSessionId(newId);
+      const workspacePath = await invoke<string>("select_workspace_directory");
+      
+      setWorkspacePath(workspacePath);
+      console.log("selected workspace:", workspacePath);
+      const sessionId = await invoke<string>("create_agent_session", {
+        workspace: workspacePath,
+      });
+      console.log("sessionId:", sessionId);
+
+      // Extract directory name for session name
+      const dirName = workspacePath.split("/").pop() || workspacePath.split("\\").pop() || "New Session";
+      const newSession: Session = {
+        id: sessionId,
+        name: dirName,
+        workspace_path: workspacePath,
+        created_at: parseInt(`${Date.now() / 1000}`),
+        last_active: parseInt(`${Date.now() / 1000}`),
+      };
+
+
+      console.log("newSession",newSession)
+      await invoke("save_session", { session: newSession });
+      setSessions((prev) => [...prev, newSession]);
+      setActiveSessionId(sessionId);
       setMessages([]);
     } catch (err) {
-      const message =
-        err instanceof Error ? err.message : "Failed to create session";
+      const message = err instanceof Error ? err.message : "Failed to create session";
+      console.error("create new session error:", err);
       setError(message);
     } finally {
+      setIsSelectingWorkspace(false);
       setIsCreatingSession(false);
     }
   };
 
-  const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
+  const switchSession = (sessionId: string) => {
+    setActiveSessionId(sessionId);
+    const session = sessions.find((s) => s.id === sessionId);
+    if (session) {
+      setWorkspacePath(session.workspace_path);
+      setMessages([]); // Clear messages when switching sessions
+    }
+    setError(null);
+  };
+
+  const deleteSession = async (sessionId: string, event: React.MouseEvent) => {
+    event.stopPropagation();
+    try {
+      await invoke("delete_session", { sessionId });
+      setSessions((prev) => prev.filter((s) => s.id !== sessionId));
+      if (activeSessionId === sessionId) {
+        setActiveSessionId(null);
+        setWorkspacePath(null);
+        setMessages([]);
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Failed to delete session";
+      setError(message);
+    }
+  };
+
+  const handleSubmit = async (event: React.FormEvent) => {
     event.preventDefault();
     const prompt = draft.trim();
     if (!prompt || isSending) {
@@ -51,7 +119,21 @@ function App() {
     setError(null);
 
     try {
-      const activeSessionId = await ensureSession();
+      // Update session last active time
+      if (activeSessionId) {
+        const session = sessions.find((s) => s.id === activeSessionId);
+        if (session) {
+          const updatedSession = {
+            ...session,
+            last_active: parseInt(`${Date.now() / 1000}`),
+          };
+          await invoke("save_session", { session: updatedSession });
+          setSessions((prev) =>
+            prev.map((s) => (s.id === activeSessionId ? updatedSession : s))
+          );
+        }
+      }
+
       const response = await invoke<string>("send_agent_message", {
         message: prompt,
         session_id: activeSessionId,
@@ -61,7 +143,7 @@ function App() {
         { role: "agent", text: response || "(no response received)" },
       ]);
     } catch (err) {
-      console.log("err", err);
+      console.error("Error sending message:", err);
       const message =
         err instanceof Error ? err.message : "Failed to reach the agent";
       setError(message);
@@ -70,67 +152,132 @@ function App() {
     }
   };
 
+  const formatTimestamp = (timestamp: number) => {
+    const now = Date.now() / 1000;
+    const diff = now - timestamp;
+    if (diff < 60) return "Just now";
+    if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
+    if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
+    return new Date(timestamp * 1000).toLocaleDateString();
+  };
+
+  const getActiveSession = () => sessions.find((s) => s.id === activeSessionId);
+
   return (
     <main className="app">
-      <section className="panel">
-        <header className="panel__header">
-          <div>
-            <p className="eyebrow">Agent Client Protocol</p>
-            <h1>Codex chat</h1>
-            <p className="subtext">
-              Send a message to the bundled codex-acp agent and read the reply.
-            </p>
-          </div>
-          <div className="header-actions">
-            <button
-              type="button"
-              className="ghost"
-              onClick={startNewSession}
-              disabled={isCreatingSession || isSending}
-            >
-              {isCreatingSession ? "Creating…" : "New session"}
-            </button>
-            <span className="badge">
-              {sessionId
-                ? `Session ${sessionId.slice(0, 8)}…`
-                : "Session not started"}
-            </span>
-            <span className="badge subtle">
-              {isSending ? "Working…" : "Idle"}
-            </span>
-          </div>
-        </header>
-
-        <div className="conversation">
-          {messages.length === 0 && (
-            <p className="placeholder">
-              Ask a question to start a session with the agent.
-            </p>
-          )}
-          {messages.map((message, index) => (
-            <div
-              key={`${message.role}-${index}`}
-              className={`bubble bubble--${message.role}`}
-            >
-              <span className="bubble__label">
-                {message.role === "user" ? "You" : "Agent"}
-              </span>
-              <p>{message.text}</p>
-            </div>
-          ))}
+      {/* Sidebar */}
+      <aside className="sidebar">
+        <div className="sidebar-header">
+          <h2>Sessions</h2>
+          <button
+            type="button"
+            className="new-session-btn"
+            onClick={createNewSession}
+            disabled={isCreatingSession || isSelectingWorkspace}
+          >
+            {isSelectingWorkspace ? "Selecting..." : "+ New Session"}
+          </button>
         </div>
 
-        {error && <p className="error">{error}</p>}
+        <div className="session-list">
+          {sessions.length === 0 ? (
+            <div className="empty-sessions">
+              <p>No sessions yet</p>
+              <p className="subtext">Create a new session to get started</p>
+            </div>
+          ) : (
+            sessions.map((session) => (
+              <div
+                key={session.id}
+                className={`session-item ${session.id === activeSessionId ? "active" : ""}`}
+                onClick={() => switchSession(session.id)}
+              >
+                <div className="session-info">
+                  <span className="session-name">{session.name}</span>
+                  <span className="session-time">
+                    {formatTimestamp(session.last_active)}
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  className="delete-btn"
+                  onClick={(e) => deleteSession(session.id, e)}
+                  title="Delete session"
+                >
+                  ×
+                </button>
+              </div>
+            ))
+          )}
+        </div>
+      </aside>
 
-        <form className="prompt" onSubmit={handleSubmit}>
+      {/* Main Content */}
+      <section className="main-content">
+        <header className="main-header">
+          <div>
+            {getActiveSession() ? (
+              <>
+                <h1>{getActiveSession()?.name}</h1>
+                <p className="subtext workspace-path">
+                  📁 {workspacePath}
+                </p>
+              </>
+            ) : (
+              <>
+                <h1>Open Cowork</h1>
+                <p className="subtext">
+                  Select or create a session to start chatting with Codex
+                </p>
+              </>
+            )}
+          </div>
+          {isSending && <span className="status-badge">Working...</span>}
+        </header>
+
+        <div className="chat-area">
+          {messages.length === 0 ? (
+            <div className="empty-chat">
+              <p>
+                {getActiveSession()
+                  ? "Start a conversation with Codex"
+                  : "Create a session to begin"}
+              </p>
+            </div>
+          ) : (
+            messages.map((message, index) => (
+              <div
+                key={`${message.role}-${index}`}
+                className={`message message--${message.role}`}
+              >
+                <span className="message-label">
+                  {message.role === "user" ? "You" : "Codex"}
+                </span>
+                <p className="message-text">{message.text}</p>
+              </div>
+            ))
+          )}
+        </div>
+
+        {error && <div className="error-banner">{error}</div>}
+
+        <form className="input-area" onSubmit={handleSubmit}>
           <textarea
             value={draft}
             onChange={(event) => setDraft(event.currentTarget.value)}
-            placeholder="Describe what you want the agent to do..."
+            placeholder={
+              getActiveSession()
+                ? "Describe what you want Codex to do..."
+                : "Create a session first"
+            }
             rows={3}
+            disabled={!activeSessionId || isSending}
           />
-          <button type="submit" disabled={isSending || !draft.trim()}>
-            {isSending ? "Sending…" : "Send to agent"}
+          <button
+            type="submit"
+            disabled={isSending || !draft.trim() || !activeSessionId}
+          >
+            {isSending ? "Sending..." : "Send"}
           </button>
         </form>
       </section>

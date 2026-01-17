@@ -1,4 +1,8 @@
-use std::sync::Arc;
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use agent_client_protocol as acp;
 use tokio::sync::Mutex;
@@ -6,11 +10,37 @@ use tokio::sync::Mutex;
 #[derive(Clone)]
 pub struct AcpClient {
     output: Arc<Mutex<String>>,
+    workspace: Arc<Mutex<Option<PathBuf>>>,
 }
 
 impl AcpClient {
     pub fn new(output: Arc<Mutex<String>>) -> Self {
-        Self { output }
+        Self {
+            output,
+            workspace: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    pub async fn set_workspace(&self, path: PathBuf) {
+        *self.workspace.lock().await = Some(path);
+    }
+
+    async fn ensure_in_workspace(&self, file_path: &Path) -> Result<(), String> {
+        let workspace = self.workspace.lock().await;
+        if let Some(ref workspace_path) = *workspace {
+            if let Ok(abs_path) = file_path.canonicalize() {
+                if let Ok(workspace_abs) = workspace_path.canonicalize() {
+                    if !abs_path.starts_with(&workspace_abs) {
+                        return Err(format!(
+                            "Access denied: {} is outside workspace {}",
+                            file_path.display(),
+                            workspace_path.display()
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -35,16 +65,40 @@ impl acp::Client for AcpClient {
 
     async fn write_text_file(
         &self,
-        _args: acp::WriteTextFileRequest,
+        args: acp::WriteTextFileRequest,
     ) -> acp::Result<acp::WriteTextFileResponse> {
-        Err(acp::Error::method_not_found())
+        let path = PathBuf::from(&args.path);
+        if let Err(e) = self.ensure_in_workspace(&path).await {
+            return Err(acp::Error::new(-1, e));
+        }
+
+        // Ensure parent directory exists
+        if let Some(parent) = path.parent() {
+            if !parent.exists() {
+                fs::create_dir_all(parent)
+                    .map_err(|e| acp::Error::new(-2, format!("Failed to create directory: {}", e)))?;
+            }
+        }
+
+        fs::write(&path, args.content)
+            .map_err(|e| acp::Error::new(-3, format!("Failed to write file: {}", e)))?;
+
+        Ok(acp::WriteTextFileResponse::new())
     }
 
     async fn read_text_file(
         &self,
-        _args: acp::ReadTextFileRequest,
+        args: acp::ReadTextFileRequest,
     ) -> acp::Result<acp::ReadTextFileResponse> {
-        Err(acp::Error::method_not_found())
+        let path = PathBuf::from(&args.path);
+        if let Err(e) = self.ensure_in_workspace(&path).await {
+            return Err(acp::Error::new(-1, e));
+        }
+
+        let content = fs::read_to_string(&path)
+            .map_err(|e| acp::Error::new(-4, format!("Failed to read file: {}", e)))?;
+
+        Ok(acp::ReadTextFileResponse::new(content))
     }
 
     async fn create_terminal(

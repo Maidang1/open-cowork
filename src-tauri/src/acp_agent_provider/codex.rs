@@ -21,6 +21,7 @@ struct AgentWorker {
 
 enum WorkerRequest {
     NewSession {
+        workspace: Option<String>,
         reply: tokio::sync::oneshot::Sender<Result<String, String>>,
     },
     Prompt {
@@ -60,17 +61,24 @@ pub async fn send_codex_message(
         .map_err(|err| format!("Agent channel closed: {err}"))?
 }
 
-/// Starts a new session and returns its identifier. Also updates the default session in the worker.
-pub async fn new_codex_session() -> Result<String, String> {
+/// Starts a new session with the given workspace directory.
+/// If workspace is None, uses the current working directory.
+pub async fn new_codex_session(workspace: Option<String>) -> Result<String, String> {
     let worker = AGENT_WORKER
         .get_or_init(start_worker)
         .as_ref()
-        .map_err(|err| err.clone())?;
+        .map_err(|err| {
+            println!("new_codex_session error: {err}");
+            err.clone()
+        })?;
 
     let (tx, rx) = tokio::sync::oneshot::channel();
     worker
         .sender
-        .send(WorkerRequest::NewSession { reply: tx })
+        .send(WorkerRequest::NewSession {
+            workspace,
+            reply: tx,
+        })
         .map_err(|err| format!("Agent channel send failed: {err}"))?;
 
     rx.await
@@ -122,9 +130,10 @@ fn start_worker() -> Result<AgentWorker, String> {
 
             let output = Arc::new(tokio::sync::Mutex::new(String::new()));
             let client = AcpClient::new(output.clone());
+            let client_arc = Arc::new(client);
 
             let (agent_conn, io_task) =
-                acp::ClientSideConnection::new(client, stdin, stdout, |fut| {
+                acp::ClientSideConnection::new(client_arc.clone(), stdin, stdout, |fut| {
                     tokio::task::spawn_local(fut);
                 });
             tokio::task::spawn_local(io_task);
@@ -150,9 +159,27 @@ fn start_worker() -> Result<AgentWorker, String> {
 
             while let Some(request) = rx.recv().await {
                 match request {
-                    WorkerRequest::NewSession { reply } => {
+                    WorkerRequest::NewSession { workspace, reply } => {
+                        let workspace_path = if let Some(w) = workspace {
+                            PathBuf::from(w)
+                        } else {
+                            cwd.clone()
+                        };
+
+                        // Validate workspace directory exists
+                        if !workspace_path.exists() {
+                            let _ = reply.send(Err(format!(
+                                "Workspace directory does not exist: {}",
+                                workspace_path.display()
+                            )));
+                            continue;
+                        }
+
+                        // Update client workspace before creating session
+                        client_arc.set_workspace(workspace_path.clone()).await;
+
                         let new_session = agent_conn
-                            .new_session(acp::NewSessionRequest::new(cwd.clone()))
+                            .new_session(acp::NewSessionRequest::new(workspace_path))
                             .await
                             .map_err(|err| format!("new_session failed: {err}"));
 
