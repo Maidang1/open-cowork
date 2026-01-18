@@ -4,6 +4,7 @@ use std::{
     sync::Arc,
 };
 
+use crate::event_bus::{self, AgentEvent};
 use agent_client_protocol as acp;
 use tokio::sync::Mutex;
 
@@ -11,6 +12,7 @@ use tokio::sync::Mutex;
 pub struct AcpClient {
     output: Arc<Mutex<String>>,
     workspace: Arc<Mutex<Option<PathBuf>>>,
+    current_session_id: Arc<Mutex<Option<String>>>,
 }
 
 impl AcpClient {
@@ -18,7 +20,12 @@ impl AcpClient {
         Self {
             output,
             workspace: Arc::new(Mutex::new(None)),
+            current_session_id: Arc::new(Mutex::new(None)),
         }
+    }
+
+    pub async fn set_current_session_id(&self, session_id: Option<String>) {
+        *self.current_session_id.lock().await = session_id;
     }
 
     pub async fn set_workspace(&self, path: PathBuf) {
@@ -41,6 +48,15 @@ impl AcpClient {
             }
         }
         Ok(())
+    }
+
+    async fn emit_status(&self, status: String) {
+        if let Some(session_id) = &*self.current_session_id.lock().await {
+            event_bus::emit_event(AgentEvent::Status {
+                session_id: session_id.clone(),
+                status,
+            });
+        }
     }
 }
 
@@ -68,6 +84,9 @@ impl acp::Client for AcpClient {
         args: acp::WriteTextFileRequest,
     ) -> acp::Result<acp::WriteTextFileResponse> {
         let path = PathBuf::from(&args.path);
+        
+        self.emit_status(format!("Writing file: {}", path.display())).await;
+
         if let Err(e) = self.ensure_in_workspace(&path).await {
             return Err(acp::Error::new(-1, e));
         }
@@ -91,6 +110,9 @@ impl acp::Client for AcpClient {
         args: acp::ReadTextFileRequest,
     ) -> acp::Result<acp::ReadTextFileResponse> {
         let path = PathBuf::from(&args.path);
+        
+        self.emit_status(format!("Reading file: {}", path.display())).await;
+
         if let Err(e) = self.ensure_in_workspace(&path).await {
             return Err(acp::Error::new(-1, e));
         }
@@ -140,23 +162,68 @@ impl acp::Client for AcpClient {
         &self,
         args: acp::SessionNotification,
     ) -> acp::Result<(), acp::Error> {
-        if let acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk { content, .. }) =
-            args.update
-        {
-            let text = match content {
-                acp::ContentBlock::Text(text_content) => text_content.text,
-                acp::ContentBlock::Image(_) => "<image>".into(),
-                acp::ContentBlock::Audio(_) => "<audio>".into(),
-                acp::ContentBlock::ResourceLink(resource_link) => resource_link.uri,
-                acp::ContentBlock::Resource(_) => "<resource>".into(),
-                _ => "<unknown>".into(),
-            };
+        if let Some(session_id) = &*self.current_session_id.lock().await {
+            event_bus::emit_event(AgentEvent::Update {
+                session_id: session_id.clone(),
+                update: args.update.clone(),
+            });
+        }
 
-            let mut output = self.output.lock().await;
-            if !output.is_empty() {
-                output.push('\n');
+        match args.update {
+            acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk { content, .. }) => {
+                let text = match content {
+                    acp::ContentBlock::Text(text_content) => text_content.text,
+                    acp::ContentBlock::Image(_) => "<image>".into(),
+                    acp::ContentBlock::Audio(_) => "<audio>".into(),
+                    acp::ContentBlock::ResourceLink(resource_link) => resource_link.uri,
+                    acp::ContentBlock::Resource(_) => "<resource>".into(),
+                    _ => "<unknown>".into(),
+                };
+
+                let mut output = self.output.lock().await;
+                if !output.is_empty() {
+                    output.push('\n');
+                    if let Some(session_id) = &*self.current_session_id.lock().await {
+                        event_bus::emit_event(AgentEvent::Chunk {
+                            session_id: session_id.clone(),
+                            content: "\n".to_string(),
+                        });
+                    }
+                }
+                output.push_str(&text);
+
+                if let Some(session_id) = &*self.current_session_id.lock().await {
+                    event_bus::emit_event(AgentEvent::Chunk {
+                        session_id: session_id.clone(),
+                        content: text,
+                    });
+                }
             }
-            output.push_str(&text);
+            acp::SessionUpdate::UserMessageChunk(_) => {}
+            acp::SessionUpdate::AgentThoughtChunk(acp::ContentChunk { content, .. }) => {
+                println!("AgentThoughtChunk: {:?}", content);
+                let text = match content {
+                    acp::ContentBlock::Text(text_content) => text_content.text,
+                    acp::ContentBlock::Image(_) => "<image>".into(),
+                    acp::ContentBlock::Audio(_) => "<audio>".into(),
+                    acp::ContentBlock::ResourceLink(resource_link) => resource_link.uri,
+                    acp::ContentBlock::Resource(_) => "<resource>".into(),
+                    _ => "<unknown>".into(),
+                };
+
+                if let Some(session_id) = &*self.current_session_id.lock().await {
+                    event_bus::emit_event(AgentEvent::ThoughtChunk {
+                        session_id: session_id.clone(),
+                        content: text,
+                    });
+                }
+            }
+            acp::SessionUpdate::ToolCall(_) => {}
+            acp::SessionUpdate::ToolCallUpdate(_) => {}
+            acp::SessionUpdate::Plan(_) => {}
+            acp::SessionUpdate::AvailableCommandsUpdate(_) => {}
+            acp::SessionUpdate::CurrentModeUpdate(_) => {}
+            _ => {}
         }
         Ok(())
     }

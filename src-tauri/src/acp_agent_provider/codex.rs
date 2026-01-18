@@ -4,6 +4,7 @@ use std::{
     thread,
 };
 
+use crate::event_bus::{self, AgentEvent};
 use agent_client_protocol::{self as acp, Agent};
 use tokio::{
     process::Command,
@@ -86,7 +87,8 @@ pub async fn new_codex_session(workspace: Option<String>) -> Result<String, Stri
 }
 
 fn start_worker() -> Result<AgentWorker, String> {
-    let agent_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("agents/codex/codex-acp");
+    // let agent_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("agents/codex/codex-acp");
+    let agent_path = PathBuf::from("/opt/homebrew/bin/qwen");
     if !agent_path.exists() {
         return Err(format!(
             "Agent binary not found at {}",
@@ -111,9 +113,12 @@ fn start_worker() -> Result<AgentWorker, String> {
                 .and_then(|path| path.canonicalize())
                 .map_err(|err| format!("Failed to resolve current directory: {err}"))?;
 
-            let mut child = Command::new(agent_path)
+            let mut child = Command::new("sh")
+                .arg("-c")
+                .arg("qwen --acp")
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::inherit())
                 .spawn()
                 .map_err(|err| format!("Failed to start agent: {err}"))?;
 
@@ -219,6 +224,14 @@ fn start_worker() -> Result<AgentWorker, String> {
                             }
                         };
 
+                        let session_id_str = target_session.0.as_ref().to_string();
+                        client_arc.set_current_session_id(Some(session_id_str.clone())).await;
+
+                        event_bus::emit_event(AgentEvent::Status {
+                            session_id: session_id_str.clone(),
+                            status: "Thinking...".to_string(),
+                        });
+
                         let prompt = vec![acp::ContentBlock::Text(acp::TextContent::new(message))];
 
                         {
@@ -230,6 +243,12 @@ fn start_worker() -> Result<AgentWorker, String> {
                             .prompt(acp::PromptRequest::new(target_session.clone(), prompt))
                             .await
                             .map_err(|err| format!("prompt failed: {err}"));
+
+                        client_arc.set_current_session_id(None).await;
+                        event_bus::emit_event(AgentEvent::Status {
+                            session_id: session_id_str,
+                            status: "idle".to_string(),
+                        });
 
                         if result.is_ok() {
                             sleep(Duration::from_millis(120)).await;

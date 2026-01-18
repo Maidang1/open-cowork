@@ -1,9 +1,11 @@
 mod acp_agent_provider;
 mod acp_client;
+mod event_bus;
 mod session_store;
 
 use acp_agent_provider::codex;
 use session_store::{SessionMetadata, SESSION_STORE_KEY};
+use tauri::Emitter;
 use tauri_plugin_store::StoreExt;
 use std::sync::Mutex;
 
@@ -91,6 +93,29 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_store::Builder::new().build())
+        .setup(|app| {
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let mut rx = event_bus::EVENT_BUS.1.lock().unwrap().take().unwrap();
+                while let Some(event) = rx.recv().await {
+                    match event {
+                        event_bus::AgentEvent::Status { session_id, status } => {
+                             let _ = handle.emit("agent-status", serde_json::json!({ "session_id": session_id, "status": status }));
+                        }
+                        event_bus::AgentEvent::Chunk { session_id, content } => {
+                             let _ = handle.emit("agent-chunk", serde_json::json!({ "session_id": session_id, "content": content }));
+                        }
+                        event_bus::AgentEvent::ThoughtChunk { session_id, content } => {
+                             let _ = handle.emit("agent-thought-chunk", serde_json::json!({ "session_id": session_id, "content": content }));
+                        }
+                        event_bus::AgentEvent::Update { session_id, update } => {
+                             let _ = handle.emit("agent-update", serde_json::json!({ "session_id": session_id, "update": update }));
+                        }
+                    }
+                }
+            });
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             greet,
             send_agent_message,

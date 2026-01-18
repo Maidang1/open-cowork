@@ -1,5 +1,6 @@
 import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import "./App.css";
 
 type Message = {
@@ -15,10 +16,17 @@ type Session = {
   last_active: number;
 };
 
+type SessionState = {
+  status: string; // Dynamic status string
+  streamBuffer: string;
+  thoughtBuffer: string;
+};
+
 function App() {
   const [sessions, setSessions] = useState<Session[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
+  const [sessionStates, setSessionStates] = useState<Record<string, SessionState>>({});
   const [draft, setDraft] = useState("");
   const [isSending, setIsSending] = useState(false);
   const [isCreatingSession, setIsCreatingSession] = useState(false);
@@ -29,6 +37,49 @@ function App() {
   // Load sessions on mount
   useEffect(() => {
     loadSessions();
+  }, []);
+
+  // Listen for agent events
+  useEffect(() => {
+    const unlistenStatus = listen<{ session_id: string; status: string }>("agent-status", (event) => {
+      const { session_id, status } = event.payload;
+      setSessionStates((prev) => ({
+        ...prev,
+        [session_id]: {
+          ...(prev[session_id] || { streamBuffer: "", thoughtBuffer: "" }),
+          status: status as any,
+        },
+      }));
+    });
+
+    const unlistenChunk = listen<{ session_id: string; content: string }>("agent-chunk", (event) => {
+      const { session_id, content } = event.payload;
+      setSessionStates((prev) => ({
+        ...prev,
+        [session_id]: {
+          ...(prev[session_id] || { status: "streaming", streamBuffer: "", thoughtBuffer: "" }),
+          status: "streaming",
+          streamBuffer: (prev[session_id]?.streamBuffer || "") + content,
+        },
+      }));
+    });
+
+    const unlistenThoughtChunk = listen<{ session_id: string; content: string }>("agent-thought-chunk", (event) => {
+      const { session_id, content } = event.payload;
+      setSessionStates((prev) => ({
+        ...prev,
+        [session_id]: {
+          ...(prev[session_id] || { status: "thinking", streamBuffer: "", thoughtBuffer: "" }),
+          thoughtBuffer: (prev[session_id]?.thoughtBuffer || "") + content,
+        },
+      }));
+    });
+
+    return () => {
+      unlistenStatus.then((f) => f());
+      unlistenChunk.then((f) => f());
+      unlistenThoughtChunk.then((f) => f());
+    };
   }, []);
 
   const loadSessions = async () => {
@@ -142,6 +193,18 @@ function App() {
         ...current,
         { role: "agent", text: response || "(no response received)" },
       ]);
+      
+      // Clear stream buffer for this session
+      if (activeSessionId) {
+        setSessionStates((prev) => ({
+          ...prev,
+          [activeSessionId]: {
+            status: "idle",
+            streamBuffer: "",
+            thoughtBuffer: "",
+          },
+        }));
+      }
     } catch (err) {
       console.error("Error sending message:", err);
       const message =
@@ -232,7 +295,11 @@ function App() {
               </>
             )}
           </div>
-          {isSending && <span className="status-badge">Working...</span>}
+          {activeSessionId && sessionStates[activeSessionId]?.status && sessionStates[activeSessionId].status !== 'idle' && (
+              <span className="status-badge">
+                  {sessionStates[activeSessionId].status}
+              </span>
+          )}
         </header>
 
         <div className="chat-area">
@@ -257,6 +324,26 @@ function App() {
               </div>
             ))
           )}
+          {activeSessionId && sessionStates[activeSessionId]?.thoughtBuffer && (
+            <div className="message message--agent thinking-process" style={{ opacity: 0.8 }}>
+               <span className="message-label">Thinking Process</span>
+               <p className="message-text" style={{ whiteSpace: "pre-wrap", fontStyle: "italic", color: "#888" }}>
+                 {sessionStates[activeSessionId].thoughtBuffer}
+               </p>
+            </div>
+          )}
+          {activeSessionId && sessionStates[activeSessionId]?.streamBuffer && (
+            <div className="message message--agent streaming">
+               <span className="message-label">Codex (Streaming)</span>
+               <p className="message-text">{sessionStates[activeSessionId].streamBuffer}</p>
+            </div>
+          )}
+          {activeSessionId && sessionStates[activeSessionId]?.status !== 'idle' && !sessionStates[activeSessionId]?.streamBuffer && (
+            <div className="message message--agent thinking">
+               <span className="message-label">Codex</span>
+               <p className="message-text">{sessionStates[activeSessionId]?.status || 'Thinking...'}</p>
+            </div>
+          )}
         </div>
 
         {error && <div className="error-banner">{error}</div>}
@@ -271,7 +358,7 @@ function App() {
                 : "Create a session first"
             }
             rows={3}
-            disabled={!activeSessionId || isSending}
+            // disabled={!activeSessionId || isSending}
           />
           <button
             type="submit"
