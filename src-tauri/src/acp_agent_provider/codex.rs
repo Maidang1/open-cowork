@@ -115,7 +115,7 @@ fn start_worker() -> Result<AgentWorker, String> {
 
             let mut child = Command::new("sh")
                 .arg("-c")
-                .arg("qwen --acp")
+                .arg("qwen --acp --yolo")
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::inherit())
